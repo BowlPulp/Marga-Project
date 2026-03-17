@@ -1,0 +1,33 @@
+# Python
+venv/
+__pycache__/
+*.pyc
+
+# Datasets
+FakeNewsNet/
+Rumor_RvNN/
+marga_project/data/
+
+# Model checkpoints
+checkpoints/
+*.pt
+
+# Mac
+.DS_Store
+
+# Logs
+*.log
+
+# Large files
+*.csv
+*.zip
+*.tar.gz
+
+venv/
+FakeNewsNet/
+Rumor_RvNN/
+marga_project/data/
+*.csv
+*.pt
+__pycache__/
+.DS_Store

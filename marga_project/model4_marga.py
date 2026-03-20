@@ -139,8 +139,10 @@ from transformers import (
     BertTokenizer, BertModel,
     ViTImageProcessor, ViTModel,
     get_linear_schedule_with_warmup,
+    ViTFeatureExtractor
 )
 from torch.optim import AdamW
+from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score
 from dataclasses import dataclass, field
 from typing import Optional
@@ -881,7 +883,7 @@ class MARGATrainer:
                  device:  str   = "cuda",
                  lr:      float = 2e-5,
                  weight_decay: float = 0.01,
-                 epochs:  int   = 5,
+                 epochs:  int   = 2,
                  lambda_reg: float = 0.1):
 
         self.model        = model.to(device)
@@ -1035,7 +1037,7 @@ class MARGAInference:
 
     def __init__(self, model: MARGA,
                  bert_tokenizer: BertTokenizer,
-                 ViTImageProcessor: ViTImageProcessor.from_pretrained(VIT_MODEL),
+                #  ViTImageProcessor: ViTImageProcessor.from_pretrained(VIT_MODEL),
                  graph_builder: ClaimGraphBuilder,
                  device: str = "cuda",
                  max_len: int = 128):
@@ -1115,47 +1117,73 @@ class MARGAInference:
 # 11. ENTRY POINT
 # ─────────────────────────────────────────────
 
-    def load_dataset(fakenewsnet_csv: str, twitter_csv: str) -> pd.DataFrame:
+def load_dataset(fakenewsnet_csv: str, twitter_csv: str) -> pd.DataFrame:
         frames = []
 
-    for path, text_col in [(fakenewsnet_csv, "title"), (twitter_csv, "text")]:
-        if os.path.exists(path):
-            df = pd.read_csv(path)
+        for path, text_col in [(fakenewsnet_csv, "title"), (twitter_csv, "text")]:
+            if os.path.exists(path):
+                df = pd.read_csv(path)
 
-            # ✅ REMOVE DUPLICATE COLUMNS
-            df = df.loc[:, ~df.columns.duplicated()]
+                # ✅ REMOVE DUPLICATE COLUMNS
+                df = df.loc[:, ~df.columns.duplicated()]
 
-            # ✅ Rename text column
-            if text_col in df.columns:
-                df = df.rename(columns={text_col: "text"})
+                # ✅ Rename text column
+                if text_col in df.columns:
+                    df = df.rename(columns={text_col: "text"})
 
-            # ✅ Ensure required columns exist
-            for col in ["image_path", "graph"]:
-                if col not in df.columns:
-                    df[col] = None
+                # ✅ Ensure required columns exist
+                for col in ["image_path", "graph"]:
+                    if col not in df.columns:
+                        df[col] = None
 
-            frames.append(df[["text", "label", "image_path", "graph"]])
+                # 🔥 SIMPLE + SAFE FIX (no hacks)
+                clean_df = df.copy()
 
-    # ✅ If no files found
-    if not frames:
-        print("[WARNING] No dataset CSVs found — using synthetic stub.")
-        return pd.DataFrame({
-            "text": [
-                "Government confirms new vaccine is 99% effective.",
-                "Scientists say drinking vinegar cures cancer.",
-                "UN releases annual climate change report.",
-                "Aliens landed in New York says anonymous source.",
-            ],
-            "label": [0, 1, 0, 1],
-            "image_path": [None] * 4,
-            "graph": [None] * 4,
-        })
+                # force unique column names
+                clean_df.columns = [
+                    f"{col}_{i}" if list(clean_df.columns).count(col) > 1 else col
+                    for i, col in enumerate(clean_df.columns)
+                ]
 
-    df = pd.concat(frames, ignore_index=True)
-    df = df.dropna(subset=["text", "label"])
-    df["label"] = df["label"].astype(int)
+                # rename text column again (important)
+                if "title" in clean_df.columns:
+                    clean_df = clean_df.rename(columns={"title": "text"})
 
-    return df.sample(frac=1, random_state=42).reset_index(drop=True)
+                # ensure required columns exist
+                for col in ["text", "label", "image_path", "graph"]:
+                    if col not in clean_df.columns:
+                        clean_df[col] = None
+
+                clean_df = clean_df[["text", "label", "image_path", "graph"]]
+
+                frames.append(clean_df.reset_index(drop=True))
+
+        # ✅ If no files found
+        if not frames:
+            print("[WARNING] No dataset CSVs found — using synthetic stub.")
+            return pd.DataFrame({
+                "text": [
+                    "Government confirms new vaccine is 99% effective.",
+                    "Scientists say drinking vinegar cures cancer.",
+                    "UN releases annual climate change report.",
+                    "Aliens landed in New York says anonymous source.",
+                ],
+                "label": [0, 1, 0, 1],
+                "image_path": [None] * 4,
+                "graph": [None] * 4,
+            })
+
+        df = pd.concat(
+            [f.reset_index(drop=True) for f in frames],
+            axis=0,
+            ignore_index=True
+        )
+
+   
+        df = df.dropna(subset=["text", "label"])
+        df["label"] = df["label"].astype(int)
+
+        return df.sample(frac=1, random_state=42).reset_index(drop=True)
 
 def main():
     DEVICE          = "cuda" if torch.cuda.is_available() else "cpu"
@@ -1163,7 +1191,7 @@ def main():
     VIT_MODEL       = "google/vit-base-patch16-224"
     MAX_LEN         = 128
     BATCH_SIZE      = 8
-    EPOCHS          = 5
+    EPOCHS          = 2
     TOP_K           = 5
     LAMBDA_REG      = 0.1
     FAKENEWSNET_CSV = "data/fakenewsnet.csv"
@@ -1182,63 +1210,39 @@ def main():
 # DATA LOADING (FIXED)
 # ─────────────────────────────────────────────
 
-df = load_dataset(FAKENEWSNET_CSV, TWITTER_CSV)
+    df = load_dataset(FAKENEWSNET_CSV, TWITTER_CSV)
 
-# ✅ TEXT CLEANING
-df["text"] = (
-    df["text"]
-    .astype(str)
-    .str.lower()
-    .str.strip()
-    .str.replace(r"\s+", " ", regex=True)
-)
+    # ✅ TEXT CLEANING
+    df["text"] = (
+        df["text"]
+        .astype(str)
+        .str.lower()
+        .str.strip()
+        .str.replace(r"\s+", " ", regex=True)
+    )
 
-# ✅ REMOVE LOW-QUALITY DATA
-df = df[df["text"].str.len() > 30]
+    # ✅ REMOVE LOW-QUALITY DATA
+    df = df[df["text"].str.len() > 30]
 
-# ✅ REMOVE DUPLICATES
-df = df.drop_duplicates(subset=["text"])
+    # ✅ REMOVE DUPLICATES
+    df = df.drop_duplicates(subset=["text"])
+    train_df = df
 
+    # split
+    train_df, val_df = train_test_split(df, test_size=0.2, random_state=42)
 
-def load_dataset(fakenewsnet_csv: str, twitter_csv: str) -> pd.DataFrame:
-    frames = []
+    # graph builder
+    graph_builder = ClaimGraphBuilder(bert_shared, bert_tokenizer, DEVICE)
 
-    for path, text_col in [(fakenewsnet_csv, "title"), (twitter_csv, "text")]:
-        if os.path.exists(path):
-            df = pd.read_csv(path)
+    # datasets
+    train_dataset = MARGADataset(train_df, bert_tokenizer, vit_extractor, graph_builder)
+    val_dataset   = MARGADataset(val_df, bert_tokenizer, vit_extractor, graph_builder)
 
-            # ✅ FIX: remove duplicate columns
-            df = df.loc[:, ~df.columns.duplicated()]
+    # dataloaders
+    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, collate_fn=marga_collate_fn)
+    val_loader   = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, collate_fn=marga_collate_fn)
 
-            # rename text column
-            if text_col in df.columns:
-                df = df.rename(columns={text_col: "text"})
-
-            # ensure required columns exist
-            for col in ["image_path", "graph"]:
-                if col not in df.columns:
-                    df[col] = None
-
-            frames.append(df[["text", "label", "image_path", "graph"]])
-
-    if not frames:
-        print("[WARNING] No dataset CSVs found — using synthetic stub.")
-        return pd.DataFrame({
-            "text": [
-                "Government confirms new vaccine is 99% effective.",
-                "Scientists say drinking vinegar cures cancer.",
-                "UN releases annual climate change report.",
-                "Aliens landed in New York says anonymous source.",
-            ],
-            "label": [0, 1, 0, 1],
-            "image_path": [None] * 4,
-            "graph": [None] * 4,
-        })
-
-    df = pd.concat(frames, ignore_index=True).dropna(subset=["text", "label"])
-    df["label"] = df["label"].astype(int)
-
-    return df.sample(frac=1, random_state=42).reset_index(drop=True)
+       
 
     # ── MARGA model ───────────────────────────────────────────────────
     corpus_passages = train_df["text"].dropna().sample(

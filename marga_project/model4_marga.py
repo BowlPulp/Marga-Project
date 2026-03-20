@@ -137,12 +137,13 @@ from torch_geometric.data import Data, Batch
 from torch_geometric.nn import GATConv, global_mean_pool
 from transformers import (
     BertTokenizer, BertModel,
-    ViTFeatureExtractor, ViTModel,
+    ViTImageProcessor, ViTModel,
     get_linear_schedule_with_warmup,
 )
 from torch.optim import AdamW
 from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score
 from dataclasses import dataclass, field
+from typing import Optional
 from PIL import Image
 import pandas as pd
 import numpy as np
@@ -725,10 +726,16 @@ class MARGA(nn.Module):
 
         # ── Agent execution order ─────────────────────────────────────
         # 1. Verifier first — produces text_embed needed by Retriever
-        ctx = self.verifier(ctx)
+        # Step 1: get text embedding first (minimal encoding)
+        ctx.text_embed = self.verifier._encode_text(
+            ctx.input_ids, ctx.attention_mask
+        )
 
-        # 2. Retriever — uses text_embed to query FAISS
+        # Step 2: retrieve evidence
         ctx = self.retriever(ctx)
+
+        # Step 3: full verifier (now has evidence)
+        ctx = self.verifier(ctx)
 
         # 3. Graph Analyst — independent of RAG
         ctx = self.graph_analyst(ctx)
@@ -1028,7 +1035,7 @@ class MARGAInference:
 
     def __init__(self, model: MARGA,
                  bert_tokenizer: BertTokenizer,
-                 vit_extractor: ViTFeatureExtractor,
+                 ViTImageProcessor: ViTImageProcessor.from_pretrained(VIT_MODEL),
                  graph_builder: ClaimGraphBuilder,
                  device: str = "cuda",
                  max_len: int = 128):
@@ -1040,9 +1047,11 @@ class MARGAInference:
         self.max_len        = max_len
 
     @torch.no_grad()
+   
+
     def predict(self, claim: str,
-                image: Image.Image | None = None,
-                graph_dict: dict | None   = None) -> dict:
+            image: Optional[Image.Image] = None,
+            graph_dict: Optional[dict]   = None) -> dict:
 
         t0 = time.perf_counter()
 
@@ -1106,36 +1115,47 @@ class MARGAInference:
 # 11. ENTRY POINT
 # ─────────────────────────────────────────────
 
-def load_dataset(fakenewsnet_csv: str, twitter_csv: str) -> pd.DataFrame:
-    frames = []
+    def load_dataset(fakenewsnet_csv: str, twitter_csv: str) -> pd.DataFrame:
+        frames = []
+
     for path, text_col in [(fakenewsnet_csv, "title"), (twitter_csv, "text")]:
         if os.path.exists(path):
             df = pd.read_csv(path)
+
+            # ✅ REMOVE DUPLICATE COLUMNS
+            df = df.loc[:, ~df.columns.duplicated()]
+
+            # ✅ Rename text column
             if text_col in df.columns:
                 df = df.rename(columns={text_col: "text"})
+
+            # ✅ Ensure required columns exist
             for col in ["image_path", "graph"]:
                 if col not in df.columns:
                     df[col] = None
+
             frames.append(df[["text", "label", "image_path", "graph"]])
 
+    # ✅ If no files found
     if not frames:
         print("[WARNING] No dataset CSVs found — using synthetic stub.")
         return pd.DataFrame({
-            "text":  [
+            "text": [
                 "Government confirms new vaccine is 99% effective.",
                 "Scientists say drinking vinegar cures cancer.",
                 "UN releases annual climate change report.",
                 "Aliens landed in New York says anonymous source.",
             ],
-            "label":      [0, 1, 0, 1],
+            "label": [0, 1, 0, 1],
             "image_path": [None] * 4,
-            "graph":      [None] * 4,
+            "graph": [None] * 4,
         })
 
-    df = pd.concat(frames, ignore_index=True).dropna(subset=["text", "label"])
+    df = pd.concat(frames, ignore_index=True)
+    df = df.dropna(subset=["text", "label"])
     df["label"] = df["label"].astype(int)
-    return df.sample(frac=1, random_state=42).reset_index(drop=True)
 
+    return df.sample(frac=1, random_state=42).reset_index(drop=True)
 
 def main():
     DEVICE          = "cuda" if torch.cuda.is_available() else "cpu"
@@ -1158,30 +1178,72 @@ def main():
     bert_shared = BertModel.from_pretrained(BERT_MODEL).to(DEVICE)
 
     # ── Dataset ───────────────────────────────────────────────────────
-    df    = load_dataset(FAKENEWSNET_CSV, TWITTER_CSV)
-    split = int(0.8 * len(df))
-    train_df, val_df = df.iloc[:split], df.iloc[split:]
+    # ─────────────────────────────────────────────
+# DATA LOADING (FIXED)
+# ─────────────────────────────────────────────
 
-    graph_builder = ClaimGraphBuilder(
-        bert_model=bert_shared,
-        tokenizer=bert_tokenizer,
-        device=DEVICE,
-    )
+df = load_dataset(FAKENEWSNET_CSV, TWITTER_CSV)
 
-    train_ds = MARGADataset(train_df, bert_tokenizer,
-                            vit_extractor, graph_builder, MAX_LEN)
-    val_ds   = MARGADataset(val_df,   bert_tokenizer,
-                            vit_extractor, graph_builder, MAX_LEN)
+# ✅ TEXT CLEANING
+df["text"] = (
+    df["text"]
+    .astype(str)
+    .str.lower()
+    .str.strip()
+    .str.replace(r"\s+", " ", regex=True)
+)
 
-    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE,
-                              shuffle=True,  collate_fn=marga_collate_fn)
-    val_loader   = DataLoader(val_ds,   batch_size=BATCH_SIZE,
-                              shuffle=False, collate_fn=marga_collate_fn)
+# ✅ REMOVE LOW-QUALITY DATA
+df = df[df["text"].str.len() > 30]
+
+# ✅ REMOVE DUPLICATES
+df = df.drop_duplicates(subset=["text"])
+
+
+def load_dataset(fakenewsnet_csv: str, twitter_csv: str) -> pd.DataFrame:
+    frames = []
+
+    for path, text_col in [(fakenewsnet_csv, "title"), (twitter_csv, "text")]:
+        if os.path.exists(path):
+            df = pd.read_csv(path)
+
+            # ✅ FIX: remove duplicate columns
+            df = df.loc[:, ~df.columns.duplicated()]
+
+            # rename text column
+            if text_col in df.columns:
+                df = df.rename(columns={text_col: "text"})
+
+            # ensure required columns exist
+            for col in ["image_path", "graph"]:
+                if col not in df.columns:
+                    df[col] = None
+
+            frames.append(df[["text", "label", "image_path", "graph"]])
+
+    if not frames:
+        print("[WARNING] No dataset CSVs found — using synthetic stub.")
+        return pd.DataFrame({
+            "text": [
+                "Government confirms new vaccine is 99% effective.",
+                "Scientists say drinking vinegar cures cancer.",
+                "UN releases annual climate change report.",
+                "Aliens landed in New York says anonymous source.",
+            ],
+            "label": [0, 1, 0, 1],
+            "image_path": [None] * 4,
+            "graph": [None] * 4,
+        })
+
+    df = pd.concat(frames, ignore_index=True).dropna(subset=["text", "label"])
+    df["label"] = df["label"].astype(int)
+
+    return df.sample(frac=1, random_state=42).reset_index(drop=True)
 
     # ── MARGA model ───────────────────────────────────────────────────
-    corpus_passages = df["text"].dropna().sample(
-        min(2000, len(df)), random_state=42
-    ).tolist()
+    corpus_passages = train_df["text"].dropna().sample(
+    min(2000, len(train_df)), random_state=42
+).tolist()
 
     model = MARGA(
         bert_model_name=BERT_MODEL,

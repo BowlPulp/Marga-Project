@@ -101,6 +101,7 @@ from transformers import (
 from torch.optim import AdamW
 from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score
 from PIL import Image
+from typing import Optional
 import pandas as pd
 import numpy as np
 import faiss
@@ -286,10 +287,14 @@ class GraphRAGDataset(Dataset):
             pixel_values = torch.zeros(3, 224, 224)
 
         # ── Graph ─────────────────────────────────────────────────────
+        # ✅ NO GRAPH LEAKAGE (single-node graph)
         graph_dict = row.get("graph", None)
-        if not isinstance(graph_dict, dict):
-            graph_dict = ClaimGraphBuilder.stub_graph(text)
-        graph_data = self.graph_builder.build(graph_dict)
+
+        if isinstance(graph_dict, dict):
+            graph_data = self.graph_builder.build(graph_dict)
+        else:
+            graph_data = ClaimGraphBuilder.stub_graph(text)
+            graph_data = self.graph_builder.build(graph_data)
 
         return {
             "input_ids":      enc["input_ids"].squeeze(0),
@@ -327,7 +332,7 @@ class PropagationGraphEncoder(nn.Module):
 
     def __init__(self, in_dim: int = 768, hidden_dim: int = 256,
                  out_dim: int = 128, heads1: int = 4, heads2: int = 2,
-                 dropout: float = 0.3):
+                 dropout: float = 0.5):
         super().__init__()
 
         self.gat1   = GATConv(in_dim,     hidden_dim,
@@ -643,7 +648,8 @@ class GraphRAGTrainer:
         pixel_values   = batch["pixel_values"].to(self.device)
         has_image      = batch["has_image"].to(self.device)
         labels         = batch["label"].to(self.device)
-        graph          = batch["graph"].to(self.device)
+        graph = batch["graph"]
+        graph = graph.to(self.device)
 
         with torch.no_grad():
             text_embeds = self.model.encode_text(input_ids, attention_mask)
@@ -694,7 +700,7 @@ class GraphRAGTrainer:
             latencies.append(lat_ms)
 
             all_preds.extend(torch.argmax(logits, 1).cpu().numpy())
-            all_labels.extend(batch["label"].numpy())
+            all_labels.extend(batch["label"].cpu().numpy())
 
         return {
             "accuracy":        accuracy_score(all_labels, all_preds),
@@ -765,8 +771,8 @@ class GraphRAGInference:
 
     @torch.no_grad()
     def predict(self, claim: str,
-                image: Image.Image | None = None,
-                graph_dict: dict | None   = None) -> dict:
+            image: Optional[Image.Image] = None,
+            graph_dict: Optional[dict] = None) -> dict:
 
         t0 = time.perf_counter()
 
@@ -840,34 +846,44 @@ class GraphRAGInference:
 
 def load_dataset(fakenewsnet_csv: str, twitter_csv: str) -> pd.DataFrame:
     frames = []
-    for path, text_col in [(fakenewsnet_csv, "title"), (twitter_csv, "text")]:
-        if os.path.exists(path):
-            df = pd.read_csv(path)
-            if text_col in df.columns:
-                df = df.rename(columns={text_col: "text"})
-            for col in ["image_path", "graph"]:
-                if col not in df.columns:
-                    df[col] = None
-            frames.append(df[["text", "label", "image_path", "graph"]])
+
+    def clean_df(df, text_col, source_name):
+        if text_col in df.columns:
+            df = df.rename(columns={text_col: "text"})
+
+        df = df.loc[:, ~df.columns.duplicated()]
+
+        for col in ["image_path", "graph"]:
+            if col not in df.columns:
+                df[col] = None
+
+        df["source"] = source_name   # ✅ IMPORTANT
+
+        return df[["text", "label", "image_path", "graph", "source"]]
+
+    if os.path.exists(fakenewsnet_csv):
+        df1 = pd.read_csv(fakenewsnet_csv)
+        frames.append(clean_df(df1, "title", "fakenewsnet"))
+
+    if os.path.exists(twitter_csv):
+        df2 = pd.read_csv(twitter_csv)
+        frames.append(clean_df(df2, "text", "twitter"))
 
     if not frames:
-        print("[WARNING] No dataset CSVs found — using synthetic stub.")
+        print("[WARNING] No dataset found — using stub.")
         return pd.DataFrame({
-            "text":  [
-                "Government confirms new vaccine is 99% effective.",
-                "Scientists say drinking vinegar cures cancer.",
-                "UN releases annual climate change report.",
-                "Aliens landed in New York says anonymous source.",
-            ],
-            "label":      [0, 1, 0, 1],
-            "image_path": [None] * 4,
-            "graph":      [None] * 4,
+            "text": ["Fake news example", "Real news example"],
+            "label": [1, 0],
+            "image_path": [None, None],
+            "graph": [None, None],
+            "source": ["stub", "stub"],
         })
 
-    df = pd.concat(frames, ignore_index=True).dropna(subset=["text", "label"])
+    df = pd.concat(frames, ignore_index=True)
+    df = df.dropna(subset=["text", "label"])
     df["label"] = df["label"].astype(int)
-    return df.sample(frac=1, random_state=42).reset_index(drop=True)
 
+    return df.reset_index(drop=True)
 
 def main():
     DEVICE          = "cuda" if torch.cuda.is_available() else "cpu"
@@ -875,7 +891,7 @@ def main():
     VIT_MODEL       = "google/vit-base-patch16-224"
     MAX_LEN         = 128
     BATCH_SIZE      = 8
-    EPOCHS          = 5
+    EPOCHS          = 3
     TOP_K           = 5
     FAKENEWSNET_CSV = "data/fakenewsnet.csv"
     TWITTER_CSV     = "data/twitter_misinfo.csv"
@@ -894,9 +910,37 @@ def main():
     )
 
     # ── Dataset ───────────────────────────────────────────────────────
-    df    = load_dataset(FAKENEWSNET_CSV, TWITTER_CSV)
-    split = int(0.8 * len(df))
-    train_df, val_df = df.iloc[:split], df.iloc[split:]
+    # ── Dataset ───────────────────────────────────────────────────────
+    df = load_dataset(FAKENEWSNET_CSV, TWITTER_CSV)
+
+    # ✅ TEXT NORMALIZATION (VERY IMPORTANT)
+    df["text"] = (
+        df["text"]
+        .astype(str)
+        .str.lower()
+        .str.strip()
+        .str.replace(r"\s+", " ", regex=True)
+    )
+
+    # ✅ REMOVE LOW-INFO TEXT
+    df = df[df["text"].str.len() > 30]
+
+    # ✅ REMOVE DUPLICATES
+    df = df.drop_duplicates(subset=["text"])
+
+    # ✅ SPLIT FIRST (NO LEAKAGE)
+    from sklearn.model_selection import train_test_split
+
+    train_df, val_df = train_test_split(
+        df,
+        test_size=0.2,
+        stratify=df["label"],
+        random_state=42
+    )
+
+    # ✅ OPTIONAL SAMPLING (AFTER SPLIT)
+    train_df = train_df.sample(min(1000, len(train_df)), random_state=42)
+    val_df   = val_df.sample(min(300, len(val_df)), random_state=42)
 
     train_ds = GraphRAGDataset(train_df, bert_tokenizer,
                                vit_extractor, graph_builder, MAX_LEN)
@@ -909,8 +953,14 @@ def main():
                               shuffle=False, collate_fn=graph_rag_collate_fn)
 
     # ── Evidence corpus ───────────────────────────────────────────────
-    passages = df["text"].dropna().sample(
-        min(2000, len(df)), random_state=42
+    texts = train_df["text"]
+
+    # fix if it's accidentally a DataFrame
+    if isinstance(texts, pd.DataFrame):
+        texts = texts.iloc[:, 0]
+
+    passages = texts.dropna().astype(str).sample(
+        min(2000, len(texts)), random_state=42
     ).tolist()
     corpus = EvidenceCorpus(passages, bert_shared, bert_tokenizer, DEVICE)
     corpus.build_index()
